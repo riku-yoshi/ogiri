@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>大喜利対決</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#fff8ec;--card:#fff;--ink:#2a2118;--sub:#7a6a58;--acc:#e8590c;--line:#ecdcc4;--ok:#2f9e44}
+@media (prefers-color-scheme:dark){:root{--bg:#1c1712;--card:#2a231b;--ink:#f6ead8;--sub:#b5a28a;--acc:#ff8a3d;--line:#443a2d;--ok:#69db7c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Hiragino Sans","Noto Sans JP",system-ui,sans-serif;line-height:1.6}
+main{max-width:640px;margin:0 auto;padding:16px}
+h1{font-size:26px;margin:8px 0;text-align:center}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin:12px 0}
+.odai{font-size:20px;font-weight:700}
+.tag{display:inline-block;background:var(--acc);color:#fff;border-radius:999px;padding:2px 12px;font-size:13px;font-weight:700}
+button{font:inherit;border:0;border-radius:10px;padding:10px 18px;background:var(--acc);color:#fff;font-weight:700;cursor:pointer}
+button:disabled{opacity:.5}
+button.sm{background:transparent;color:var(--sub);border:1px solid var(--line);padding:4px 10px;font-weight:400}
+input,textarea{font:inherit;width:100%;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--ink);margin-top:6px}
+.row{display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.sub{color:var(--sub);font-size:14px}
+.score{font-size:28px;font-weight:800;color:var(--acc)}
+.ans{border-top:1px dashed var(--line);padding:10px 0}
+.win{color:var(--ok);font-weight:800}
+</style>
+</head>
+<body>
+<main>
+<h1>🎤 大喜利対決</h1>
+<div id="app" class="sub">読み込み中…</div>
+</main>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getFirestore, doc, collection, onSnapshot, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+// ▼▼ ここにFirebaseの設定を貼る（firebaseConfig の中身）▼▼
+const firebaseConfig = {
+  apiKey: "AIzaSyAiyElxVuwC13q1pQKbse93ayyfjD5bVmA",
+  authDomain: "ogiri-game-c96ba.firebaseapp.com",
+  projectId: "ogiri-game-c96ba",
+  storageBucket: "ogiri-game-c96ba.firebasestorage.app",
+  messagingSenderId: "74798516722",
+  appId: "1:74798516722:web:ae474c9a7e5448747f836b"
+};
+// ▲▲ ここまで ▲▲
+
+const TOTAL = 9;
+const fs = getFirestore(initializeApp(firebaseConfig));
+const gameRef = doc(fs, "ogiri", "main");
+const store = { get: k => { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} } };
+let me = store.get("ogiri_id");
+if (!me) { me = "u" + Math.random().toString(36).slice(2, 10); store.set("ogiri_id", me); }
+let game = { phase: "lobby" }, players = {}, answers = {};
+let draft = "", nameDraft = store.get("ogiri_name"), apiKey = store.get("ogiri_key"), model = store.get("ogiri_model") || "gemini-2.5-flash";
+let busy = "", err = "", judging = false, ready = false;
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const nameOf = id => esc((players[id] && players[id].name) || "だれか");
+const key = (id, r = game.round) => `${game.gameId}_${r}_${id}`;
+const roundAnswers = () => (game.players || []).map(id => ({ id, a: answers[key(id)] }));
+
+async function askGemini(prompt) {
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json" } })
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error((j.error && j.error.message) || "Gemini error " + r.status);
+  const t = j.candidates[0].content.parts[0].text.replace(/```json|```/g, "").trim();
+  return JSON.parse(t);
+}
+
+onSnapshot(gameRef, s => { game = s.exists() ? s.data() : { phase: "lobby" }; ready = true; render(); hostCheck(); }, e => { err = "接続エラー: " + e.message; $("#app").textContent = err; });
+onSnapshot(collection(fs, "ogiri_players"), s => { players = {}; s.forEach(d => players[d.id] = d.data()); render(); });
+onSnapshot(collection(fs, "ogiri_answers"), s => { answers = {}; s.forEach(d => answers[d.id] = d.data()); render(); hostCheck(); });
+
+const totals = () => {
+  const t = {};
+  (game.players || []).forEach(id => t[id] = 0);
+  Object.values(game.results || {}).forEach(r => Object.entries(r).forEach(([id, v]) => { t[id] = (t[id] || 0) + (v.s || 0); }));
+  return t;
+};
+const ranking = () => Object.entries(totals()).sort((a, b) => b[1] - a[1]);
+
+async function join() { const n = nameDraft.trim().slice(0, 12); if (!n) return; store.set("ogiri_name", n); await setDoc(doc(fs, "ogiri_players", me), { name: n }); }
+async function kick(id) { await deleteDoc(doc(fs, "ogiri_players", id)); }
+
+async function start() {
+  const ids = Object.keys(players);
+  if (ids.length < 2) return;
+  if (!apiKey) { err = "Geminiのキーを入れてね"; render(); return; }
+  busy = "AIがお題を考え中…"; err = ""; render();
+  try {
+    const r = await askGemini(`大喜利のお題を日本語で${TOTAL}個作ってください。「こんな〇〇は嫌だ」「〇〇の意外な使い道」「〇〇が言いそうなひとこと」など形式をバラけさせ、友達同士で盛り上がる軽いノリで。1つ40字以内。次のJSONだけを返す: {"prompts":["...",...]}`);
+    const prompts = (r.prompts || []).slice(0, TOTAL);
+    if (prompts.length < TOTAL) throw new Error("お題が足りませんでした");
+    draft = "";
+    await setDoc(gameRef, { phase: "answer", gameId: String(Date.now()), hostId: me, players: ids, round: 0, prompts, results: {} });
+  } catch (e) { err = "お題の生成に失敗: " + e.message; }
+  busy = ""; render();
+}
+
+async function submit() {
+  const t = draft.trim().slice(0, 100);
+  if (!t) return;
+  draft = "";
+  await setDoc(doc(fs, "ogiri_answers", key(me)), { gameId: game.gameId, round: game.round, text: t });
+}
+
+async function hostCheck() {
+  if (!ready || game.phase !== "answer" || game.hostId !== me || judging) return;
+  const rows = roundAnswers();
+  if (!rows.every(r => r.a)) return;
+  judging = true; busy = "AI審査員が採点中…"; err = ""; render();
+  try {
+    const list = rows.map((r, i) => `${i}: ${r.a.text}`).join("\n");
+    const r = await askGemini(`あなたは大喜利の審査員です。公平に採点してください。\nお題: ${game.prompts[game.round]}\n回答:\n${list}\n\n各回答を0〜10の整数で採点し、30字程度の短いコメントを日本語でつけてください。面白さ・意外性・お題への合い具合を見てください。次のJSONだけを返す: {"results":[{"i":0,"score":7,"comment":"..."}]}`);
+    const res = {};
+    rows.forEach((row, i) => {
+      const x = (r.results || []).find(z => z.i === i) || {};
+      res[row.id] = { s: Math.max(0, Math.min(10, Math.round(Number(x.score) || 0))), c: String(x.comment || ""), t: row.a.text };
+    });
+    await setDoc(gameRef, { ...game, phase: "result", results: { ...game.results, [game.round]: res } });
+  } catch (e) { err = "採点に失敗: " + e.message + "（ページを開き直すとやり直せるよ）"; }
+  judging = false; busy = ""; render();
+}
+async function next() {
+  if (game.round + 1 >= TOTAL) await setDoc(gameRef, { ...game, phase: "final" });
+  else await setDoc(gameRef, { ...game, phase: "answer", round: game.round + 1 });
+}
+async function toLobby() { await setDoc(gameRef, { phase: "lobby" }); }
+
+function render() {
+  if (!ready) return;
+  const isHost = game.hostId === me, inGame = (game.players || []).includes(me);
+  let h = "";
+  if (err) h += `<div class="card" style="border-color:var(--acc)">${esc(err)}</div>`;
+  if (busy) h += `<div class="card">⏳ ${esc(busy)}</div>`;
+  if (game.phase === "lobby") {
+    const ids = Object.keys(players);
+    h += `<div class="card"><div class="row"><b>参加者（${ids.length}人）</b><span class="sub">${TOTAL}問勝負</span></div>`;
+    h += ids.map(id => `<div class="row ans"><span>${nameOf(id)}${id === me ? "（あなた）" : ""}</span><button class="sm" data-kick="${esc(id)}">外す</button></div>`).join("") || `<div class="sub">まだ誰もいないよ</div>`;
+    h += `</div>`;
+    if (!players[me]) h += `<div class="card"><input id="nm" maxlength="12" placeholder="ニックネーム" value="${esc(nameDraft)}"><div style="margin-top:8px"><button id="join">参加する</button></div></div>`;
+    else h += `<div class="card"><b>進行役の人だけ</b><div class="sub">Geminiのキー（このブラウザにだけ保存されるよ）</div><input id="key" type="password" placeholder="AIza..." value="${esc(apiKey)}"><div class="sub" style="margin-top:6px">モデル名</div><input id="mdl" value="${esc(model)}"><div style="margin-top:10px"><button id="start" ${ids.length < 2 || busy ? "disabled" : ""}>ゲーム開始（2人以上）</button></div></div>`;
+  } else if (!inGame && game.phase !== "final") {
+    h += `<div class="card">ゲーム進行中です。観戦中…（${game.round + 1}/${TOTAL}問目）</div><div class="card"><div class="odai">${esc(game.prompts[game.round])}</div></div>`;
+  } else if (game.phase === "answer") {
+    const rows = roundAnswers(), done = rows.filter(r => r.a).length;
+    h += `<div class="card"><span class="tag">第${game.round + 1}問 / ${TOTAL}</span><div class="odai" style="margin-top:8px">${esc(game.prompts[game.round])}</div></div>`;
+    if (!answers[key(me)]) h += `<div class="card"><textarea id="ans" rows="3" maxlength="100" placeholder="回答を入力">${esc(draft)}</textarea><div style="margin-top:8px"><button id="sub">回答する</button></div></div>`;
+    else h += `<div class="card">✅ 回答したよ。みんなを待っています…</div>`;
+    h += `<div class="sub">回答済み ${done}/${rows.length}人</div>`;
+  } else if (game.phase === "result") {
+    const res = game.results[game.round] || {};
+    h += `<div class="card"><span class="tag">第${game.round + 1}問の結果</span><div class="odai" style="margin-top:8px">${esc(game.prompts[game.round])}</div></div><div class="card">`;
+    h += Object.entries(res).sort((a, b) => b[1].s - a[1].s).map(([id, v]) => `<div class="ans"><div class="row"><b>${nameOf(id)}</b><span class="score">${v.s}点</span></div><div>${esc(v.t)}</div><div class="sub">🧑‍⚖️ ${esc(v.c)}</div></div>`).join("");
+    h += `</div><div class="card"><b>現在の合計</b>` + ranking().map(([id, s], i) => `<div class="row"><span>${i + 1}位 ${nameOf(id)}</span><b>${s}点</b></div>`).join("") + `</div>`;
+    h += isHost ? `<button id="next">${game.round + 1 >= TOTAL ? "最終結果へ" : "次の問題へ"}</button>` : `<div class="sub">進行役（${nameOf(game.hostId)}）が次へ進めるのを待ってね</div>`;
+  } else if (game.phase === "final") {
+    h += `<div class="card"><b>🏆 最終結果</b>` + ranking().map(([id, s], i) => `<div class="row ans"><span class="${i === 0 ? "win" : ""}">${i + 1}位 ${nameOf(id)}</span><b>${s}点</b></div>`).join("") + `</div><button id="again">ロビーに戻る</button>`;
+  }
+  const keep = document.activeElement && document.activeElement.id;
+  $("#app").innerHTML = h;
+  const on = (s, f) => { const el = $(s); if (el) el.onclick = f; };
+  on("#join", join); on("#start", start); on("#sub", submit); on("#next", next); on("#again", toLobby);
+  document.querySelectorAll("[data-kick]").forEach(b => b.onclick = () => kick(b.dataset.kick));
+  const bind = (s, f) => { const el = $(s); if (el) el.oninput = () => f(el.value); };
+  bind("#nm", v => nameDraft = v); bind("#ans", v => draft = v);
+  bind("#key", v => { apiKey = v.trim(); store.set("ogiri_key", apiKey); });
+  bind("#mdl", v => { model = v.trim() || "gemini-2.5-flash"; store.set("ogiri_model", model); });
+  if (keep) { const el = document.getElementById(keep); if (el && el.focus) el.focus(); }
+}
+</script>
+</body>
+</html>
