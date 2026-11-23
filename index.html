@@ -54,6 +54,8 @@ if (!me) { me = "u" + Math.random().toString(36).slice(2, 10); store.set("ogiri_
 let game = { phase: "lobby" }, players = {}, answers = {};
 let draft = "", nameDraft = store.get("ogiri_name"), apiKey = store.get("ogiri_key"), model = store.get("ogiri_model") || "gemini-2.5-flash";
 let busy = "", err = "", judging = false, ready = false;
+let modelList = [], modelMsg = "", runId = 0;
+let voteDraft = {}, voteDraftKey = "", advancing = false;
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const nameOf = id => esc((players[id] && players[id].name) || "だれか");
@@ -88,6 +90,19 @@ async function askGemini(prompt) {
   throw lastErr;
 }
 
+async function listModels() {
+  if (!apiKey) { modelMsg = "先にキーを入れてね"; render(); return; }
+  modelMsg = "調べ中…"; render();
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key=${encodeURIComponent(apiKey)}`);
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || "error " + r.status);
+    modelList = (j.models || []).filter(m => (m.supportedGenerationMethods || []).includes("generateContent")).map(m => m.name.replace("models/", "")).filter(n => /gemini|gemma/.test(n));
+    modelMsg = modelList.length ? "押すとモデル名が入るよ" : "使えるモデルが見つかりませんでした";
+  } catch (e) { modelMsg = "失敗: " + e.message; }
+  render();
+}
+
 onSnapshot(gameRef, s => { game = s.exists() ? s.data() : { phase: "lobby" }; ready = true; render(); hostCheck(); }, e => { err = "接続エラー: " + e.message; $("#app").textContent = err; });
 onSnapshot(collection(fs, "ogiri_players"), s => { players = {}; s.forEach(d => players[d.id] = d.data()); render(); });
 onSnapshot(collection(fs, "ogiri_answers"), s => { answers = {}; s.forEach(d => answers[d.id] = d.data()); render(); hostCheck(); });
@@ -107,14 +122,15 @@ async function start() {
   const ids = Object.keys(players);
   if (ids.length < 2) return;
   if (!apiKey) { err = "Geminiのキーを入れてね"; render(); return; }
-  busy = "AIがお題を考え中…"; err = ""; render();
+  const run = ++runId; busy = "AIがお題を考え中…"; err = ""; render();
   try {
     const r = await askGemini(`大喜利のお題を日本語で${TOTAL}個作ってください。「こんな〇〇は嫌だ」「〇〇の意外な使い道」「〇〇が言いそうなひとこと」など形式をバラけさせ、友達同士で盛り上がる軽いノリで。1つ40字以内。次のJSONだけを返す: {"prompts":["...",...]}`);
+    if (run !== runId) { busy = ""; render(); return; }
     const prompts = (r.prompts || []).slice(0, TOTAL);
     if (prompts.length < TOTAL) throw new Error("お題が足りませんでした");
     draft = "";
-    await setDoc(gameRef, { phase: "answer", gameId: String(Date.now()), hostId: me, players: ids, round: 0, prompts, results: {} });
-  } catch (e) { err = "お題の生成に失敗: " + e.message; }
+    await setDoc(gameRef, { phase: "answer", gameId: String(Date.now()), hostId: me, players: ids, round: 0, prompts, results: {}, ai: {} });
+  } catch (e) { if (run !== runId) { busy = ""; render(); return; } err = "お題の生成に失敗: " + e.message; }
   busy = ""; render();
 }
 
@@ -125,42 +141,94 @@ async function submit() {
   await setDoc(doc(fs, "ogiri_answers", key(me)), { gameId: game.gameId, round: game.round, text: t });
 }
 
-async function hostCheck() {
-  if (!ready || game.phase !== "answer" || game.hostId !== me || judging) return;
-  const rows = roundAnswers();
-  if (!rows.every(r => r.a)) return;
-  judging = true; busy = "AI審査員が採点中…"; err = ""; render();
+const fmt = n => String(Math.round((n || 0) * 10) / 10);
+const vkey = (id, r = game.round) => `v_${game.gameId}_${r}_${id}`;
+const nkey = (id, r = game.round) => `n_${game.gameId}_${r}_${id}`;
+const shuffle = a => { a = [...a]; for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+async function judgeAI() {
+  const gid = game.gameId, rnd = game.round, rows = roundAnswers();
+  judging = true; err = ""; render();
+  let entry;
   try {
     const list = rows.map((r, i) => `${i}: ${r.a.text}`).join("\n");
-    const r = await askGemini(`あなたは大喜利の審査員です。公平に採点してください。\nお題: ${game.prompts[game.round]}\n回答:\n${list}\n\n各回答を0〜10の整数で採点し、30字程度の短いコメントを日本語でつけてください。面白さ・意外性・お題への合い具合を見てください。次のJSONだけを返す: {"results":[{"i":0,"score":7,"comment":"..."}]}`);
-    const res = {};
+    const r = await askGemini(`あなたは大喜利の審査員です。公平に採点してください。\nお題: ${game.prompts[rnd]}\n回答:\n${list}\n\n各回答を0〜10の整数で採点し、30字程度の短いコメントを日本語でつけてください。面白さ・意外性・お題への合い具合を見てください。次のJSONだけを返す: {"results":[{"i":0,"score":7,"comment":"..."}]}`);
+    const scores = {};
     rows.forEach((row, i) => {
       const x = (r.results || []).find(z => z.i === i) || {};
-      res[row.id] = { s: Math.max(0, Math.min(10, Math.round(Number(x.score) || 0))), c: String(x.comment || ""), t: row.a.text };
+      scores[row.id] = { s: Math.max(0, Math.min(10, Math.round(Number(x.score) || 0))), c: String(x.comment || "") };
     });
-    await setDoc(gameRef, { ...game, phase: "result", results: { ...game.results, [game.round]: res } });
-  } catch (e) { err = "採点に失敗: " + e.message + "（ページを開き直すとやり直せるよ）"; }
-  judging = false; busy = ""; render();
+    entry = { ok: true, scores };
+  } catch (e) { err = "AIの採点に失敗（投票だけで決めます）: " + e.message; entry = { ok: false }; }
+  busy = "";
+  try {
+    if (game.gameId === gid && game.round === rnd && game.phase === "vote") await setDoc(gameRef, { ai: { [rnd]: entry } }, { merge: true });
+  } catch (e) { err = "保存に失敗: " + e.message; }
+  judging = false; render();
 }
-async function next() {
-  if (game.round + 1 >= TOTAL) await setDoc(gameRef, { ...game, phase: "final" });
-  else await setDoc(gameRef, { ...game, phase: "answer", round: game.round + 1 });
+
+function buildResult() {
+  const rnd = game.round, ai = (game.ai || {})[rnd] || {}, ids = game.players || [], res = {};
+  ids.forEach(id => {
+    const a = answers[key(id)];
+    const votes = ids.filter(v => v !== id).map(v => { const d = answers[vkey(v)]; return d && d.scores ? d.scores[id] : null; }).filter(x => x != null);
+    const v10 = votes.length ? votes.reduce((p, c) => p + c, 0) / votes.length : null;
+    const sc = ai.ok && ai.scores ? ai.scores[id] : null;
+    const aiS = sc ? sc.s : null;
+    const total = aiS != null && v10 != null ? (aiS + v10) / 2 : (aiS != null ? aiS : (v10 != null ? v10 : 0));
+    res[id] = { t: a ? a.text : "", ai: aiS, v: v10 != null ? Math.round(v10 * 10) / 10 : null, c: sc ? sc.c : "", s: Math.round(total * 10) / 10 };
+  });
+  return res;
+}
+
+async function hostCheck() {
+  if (!ready || game.hostId !== me || advancing) return;
+  const ids = game.players || [], rnd = game.round;
+  let moved = false;
+  try {
+    if (game.phase === "answer") {
+      if (ids.length && ids.every(id => answers[key(id)])) { advancing = true; moved = true; await setDoc(gameRef, { phase: "vote", order: shuffle(ids) }, { merge: true }); }
+    } else if (game.phase === "vote") {
+      if (!(game.ai || {})[rnd]) { if (!judging) judgeAI(); return; }
+      if (ids.every(id => answers[vkey(id)])) { advancing = true; moved = true; await setDoc(gameRef, { phase: "result", results: { [rnd]: buildResult() } }, { merge: true }); }
+    } else if (game.phase === "result") {
+      if (ids.every(id => answers[nkey(id)])) { advancing = true; moved = true; await setDoc(gameRef, rnd + 1 >= TOTAL ? { phase: "final" } : { phase: "answer", round: rnd + 1 }, { merge: true }); }
+    }
+  } catch (e) { err = "進行エラー: " + e.message; render(); }
+  advancing = false;
+  if (moved) setTimeout(hostCheck, 0);
+}
+
+async function submitVotes() {
+  const targets = (game.players || []).filter(id => id !== me);
+  if (!targets.length || !targets.every(id => voteDraft[id] != null)) return;
+  await setDoc(doc(fs, "ogiri_answers", vkey(me)), { gameId: game.gameId, round: game.round, scores: { ...voteDraft } });
+}
+async function pressNext() { await setDoc(doc(fs, "ogiri_answers", nkey(me)), { gameId: game.gameId, round: game.round }); }
+
+async function quit() {
+  if (game.phase !== "lobby" && !confirm("ゲームをやめてロビーに戻るよ。全員のゲームが終わるけどいい？")) return;
+  runId++; busy = ""; err = "";
+  if (game.phase !== "lobby") await setDoc(gameRef, { phase: "lobby" });
+  render();
 }
 async function toLobby() { await setDoc(gameRef, { phase: "lobby" }); }
+
+const resultRows = res => Object.entries(res).sort((a, b) => b[1].s - a[1].s).map(([id, v]) => `<div class="ans"><div class="row"><b>${nameOf(id)}</b><span class="score">${fmt(v.s)}点</span></div><div>${esc(v.t)}</div><div class="sub">${v.ai != null ? `🤖 AI ${fmt(v.ai)}点` : "🤖 AI採点なし"}${v.v != null ? ` ／ 👥 みんな ${fmt(v.v)}点` : ""}</div>${v.c ? `<div class="sub">🧑‍⚖️ ${esc(v.c)}</div>` : ""}</div>`).join("");
 
 function render() {
   if (!ready) return;
   const isHost = game.hostId === me, inGame = (game.players || []).includes(me);
   let h = "";
   if (err) h += `<div class="card" style="border-color:var(--acc)">${esc(err)}</div>`;
-  if (busy) h += `<div class="card">⏳ ${esc(busy)}</div>`;
+  if (busy) h += `<div class="card row"><span>⏳ ${esc(busy)}</span><button class="sm" data-quit>やめる</button></div>`;
   if (game.phase === "lobby") {
     const ids = Object.keys(players);
     h += `<div class="card"><div class="row"><b>参加者（${ids.length}人）</b><span class="sub">${TOTAL}問勝負</span></div>`;
     h += ids.map(id => `<div class="row ans"><span>${nameOf(id)}${id === me ? "（あなた）" : ""}</span><button class="sm" data-kick="${esc(id)}">外す</button></div>`).join("") || `<div class="sub">まだ誰もいないよ</div>`;
     h += `</div>`;
     if (!players[me]) h += `<div class="card"><input id="nm" maxlength="12" placeholder="ニックネーム" value="${esc(nameDraft)}"><div style="margin-top:8px"><button id="join">参加する</button></div></div>`;
-    else h += `<div class="card"><b>進行役の人だけ</b><div class="sub">Geminiのキー（このブラウザにだけ保存されるよ）</div><input id="key" type="password" placeholder="AIza..." value="${esc(apiKey)}"><div class="sub" style="margin-top:6px">モデル名</div><input id="mdl" value="${esc(model)}"><div style="margin-top:10px"><button id="start" ${ids.length < 2 || busy ? "disabled" : ""}>ゲーム開始（2人以上）</button></div></div>`;
+    else h += `<div class="card"><b>進行役の人だけ</b><div class="sub">Geminiのキー（このブラウザにだけ保存されるよ）</div><input id="key" type="password" placeholder="AIza..." value="${esc(apiKey)}"><div class="sub" style="margin-top:6px">モデル名</div><input id="mdl" value="${esc(model)}"><div style="margin-top:6px"><button class="sm" id="lm">使えるモデルを調べる</button> <span class="sub">${esc(modelMsg)}</span></div><div>${modelList.map(m => `<button class="sm" style="margin:4px 4px 0 0" data-model="${esc(m)}">${esc(m)}</button>`).join("")}</div><div style="margin-top:10px"><button id="start" ${ids.length < 2 || busy ? "disabled" : ""}>ゲーム開始（2人以上）</button></div></div>`;
   } else if (!inGame && game.phase !== "final") {
     h += `<div class="card">ゲーム進行中です。観戦中…（${game.round + 1}/${TOTAL}問目）</div><div class="card"><div class="odai">${esc(game.prompts[game.round])}</div></div>`;
   } else if (game.phase === "answer") {
@@ -169,19 +237,46 @@ function render() {
     if (!answers[key(me)]) h += `<div class="card"><textarea id="ans" rows="3" maxlength="100" placeholder="回答を入力">${esc(draft)}</textarea><div style="margin-top:8px"><button id="sub">回答する</button></div></div>`;
     else h += `<div class="card">✅ 回答したよ。みんなを待っています…</div>`;
     h += `<div class="sub">回答済み ${done}/${rows.length}人</div>`;
+  } else if (game.phase === "vote") {
+    const ids = game.players || [], rnd = game.round;
+    const vk = game.gameId + "_" + rnd;
+    if (voteDraftKey !== vk) { voteDraftKey = vk; voteDraft = {}; }
+    const ai = (game.ai || {})[rnd], nv = ids.filter(id => answers[vkey(id)]).length;
+    h += `<div class="card"><span class="tag">第${rnd + 1}問 / ${TOTAL}・投票</span><div class="odai" style="margin-top:8px">${esc(game.prompts[rnd])}</div></div>`;
+    h += `<div class="card">${!ai ? "🤖 AIが採点中…" : (ai.ok ? "🤖 AIの採点は終わったよ" : "🤖 AIの採点はできなかったので、投票だけで決めるよ")}</div>`;
+    if (answers[vkey(me)]) h += `<div class="card">✅ 投票したよ。みんなを待っています（${nv}/${ids.length}人）</div>`;
+    else {
+      h += `<div class="card"><b>誰の回答かは伏せてあるよ。面白さを0〜10点で採点してね</b>`;
+      (game.order || ids).forEach((id, i) => {
+        const a = answers[key(id)], label = String.fromCharCode(65 + i);
+        if (id === me) h += `<div class="ans"><b>${label}</b> ${esc(a && a.text)} <span class="sub">（あなたの回答）</span></div>`;
+        else h += `<div class="ans"><b>${label}</b> ${esc(a && a.text)}<div style="margin-top:6px"><div style="display:flex;flex-wrap:wrap;gap:6px">${[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(n => `<button class="sm" style="min-width:40px;${voteDraft[id] === n ? "background:var(--acc);color:#fff;border-color:var(--acc)" : ""}" data-vote="${esc(id)}|${n}">${n}</button>`).join("")}</div></div></div>`;
+      });
+      const ok = ids.filter(id => id !== me).every(id => voteDraft[id] != null);
+      h += `<div style="margin-top:8px"><button id="vsub" ${ok ? "" : "disabled"}>投票する</button></div></div>`;
+    }
   } else if (game.phase === "result") {
-    const res = game.results[game.round] || {};
-    h += `<div class="card"><span class="tag">第${game.round + 1}問の結果</span><div class="odai" style="margin-top:8px">${esc(game.prompts[game.round])}</div></div><div class="card">`;
-    h += Object.entries(res).sort((a, b) => b[1].s - a[1].s).map(([id, v]) => `<div class="ans"><div class="row"><b>${nameOf(id)}</b><span class="score">${v.s}点</span></div><div>${esc(v.t)}</div><div class="sub">🧑‍⚖️ ${esc(v.c)}</div></div>`).join("");
-    h += `</div><div class="card"><b>現在の合計</b>` + ranking().map(([id, s], i) => `<div class="row"><span>${i + 1}位 ${nameOf(id)}</span><b>${s}点</b></div>`).join("") + `</div>`;
-    h += isHost ? `<button id="next">${game.round + 1 >= TOTAL ? "最終結果へ" : "次の問題へ"}</button>` : `<div class="sub">進行役（${nameOf(game.hostId)}）が次へ進めるのを待ってね</div>`;
+    const res = (game.results || {})[game.round] || {}, ids = game.players || [];
+    const np = ids.filter(id => answers[nkey(id)]).length;
+    h += `<div class="card"><span class="tag">第${game.round + 1}問の結果</span><div class="odai" style="margin-top:8px">${esc(game.prompts[game.round])}</div></div><div class="card">${resultRows(res)}</div>`;
+    h += `<div class="card"><b>現在の合計</b>` + ranking().map(([id, s], i) => `<div class="row"><span>${i + 1}位 ${nameOf(id)}</span><b>${fmt(s)}点</b></div>`).join("") + `</div>`;
+    h += answers[nkey(me)] ? `<div class="card">✅ 準備OK。みんなを待っています（${np}/${ids.length}人）</div>` : `<button id="next">${game.round + 1 >= TOTAL ? "最終結果へ" : "次の問題へ"}</button><div class="sub" style="margin-top:6px">全員が押すと進むよ（${np}/${ids.length}人）</div>`;
   } else if (game.phase === "final") {
-    h += `<div class="card"><b>🏆 最終結果</b>` + ranking().map(([id, s], i) => `<div class="row ans"><span class="${i === 0 ? "win" : ""}">${i + 1}位 ${nameOf(id)}</span><b>${s}点</b></div>`).join("") + `</div><button id="again">ロビーに戻る</button>`;
+    h += `<div class="card"><b>🏆 最終結果</b>` + ranking().map(([id, s], i) => `<div class="row ans"><span class="${i === 0 ? "win" : ""}">${i + 1}位 ${nameOf(id)}</span><b>${fmt(s)}点</b></div>`).join("") + `</div>`;
+    for (let r = 0; r < TOTAL; r++) {
+      const res = (game.results || {})[r];
+      if (res) h += `<div class="card"><span class="tag">第${r + 1}問</span><div class="odai" style="margin-top:8px">${esc(game.prompts[r])}</div>${resultRows(res)}</div>`;
+    }
+    h += `<button id="again">ロビーに戻る</button>`;
   }
+  if (["answer", "vote", "result"].includes(game.phase)) h += `<div style="margin-top:20px;text-align:center"><button class="sm" data-quit>ゲームをやめる</button></div>`;
   const keep = document.activeElement && document.activeElement.id;
   $("#app").innerHTML = h;
   const on = (s, f) => { const el = $(s); if (el) el.onclick = f; };
-  on("#join", join); on("#start", start); on("#sub", submit); on("#next", next); on("#again", toLobby);
+  on("#lm", listModels); on("#join", join); on("#start", start); on("#sub", submit); on("#next", pressNext); on("#vsub", submitVotes); on("#again", toLobby);
+  document.querySelectorAll("[data-model]").forEach(b => b.onclick = () => { model = b.dataset.model; store.set("ogiri_model", model); render(); });
+  document.querySelectorAll("[data-quit]").forEach(b => b.onclick = quit);
+  document.querySelectorAll("[data-vote]").forEach(b => b.onclick = () => { const [id, n] = b.dataset.vote.split("|"); voteDraft[id] = Number(n); render(); });
   document.querySelectorAll("[data-kick]").forEach(b => b.onclick = () => kick(b.dataset.kick));
   const bind = (s, f) => { const el = $(s); if (el) el.oninput = () => f(el.value); };
   bind("#nm", v => nameDraft = v); bind("#ans", v => draft = v);
