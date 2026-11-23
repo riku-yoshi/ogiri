@@ -46,6 +46,7 @@ const firebaseConfig = {
 // ▲▲ ここまで ▲▲
 
 const TOTAL = 9;
+const VER = "v3-vote10";
 const fs = getFirestore(initializeApp(firebaseConfig));
 const gameRef = doc(fs, "ogiri", "main");
 const store = { get: k => { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} } };
@@ -129,7 +130,7 @@ async function start() {
     const prompts = (r.prompts || []).slice(0, TOTAL);
     if (prompts.length < TOTAL) throw new Error("お題が足りませんでした");
     draft = "";
-    await setDoc(gameRef, { phase: "answer", gameId: String(Date.now()), hostId: me, players: ids, round: 0, prompts, results: {}, ai: {} });
+    await setDoc(gameRef, { phase: "answer", gameId: String(Date.now()), hostId: me, players: ids, round: 0, prompts, results: {}, ai: {}, ver: VER });
   } catch (e) { if (run !== runId) { busy = ""; render(); return; } err = "お題の生成に失敗: " + e.message; }
   busy = ""; render();
 }
@@ -171,7 +172,7 @@ function buildResult() {
   const rnd = game.round, ai = (game.ai || {})[rnd] || {}, ids = game.players || [], res = {};
   ids.forEach(id => {
     const a = answers[key(id)];
-    const votes = ids.filter(v => v !== id).map(v => { const d = answers[vkey(v)]; return d && d.scores ? d.scores[id] : null; }).filter(x => x != null);
+    const votes = ids.filter(v => v !== id).map(v => { const d = answers[vkey(v)]; return d && d.scores ? d.scores[id] : null; }).filter(x => x != null).map(x => Math.max(0, Math.min(10, Number(x) || 0)));
     const v10 = votes.length ? votes.reduce((p, c) => p + c, 0) / votes.length : null;
     const sc = ai.ok && ai.scores ? ai.scores[id] : null;
     const aiS = sc ? sc.s : null;
@@ -221,6 +222,7 @@ function render() {
   const isHost = game.hostId === me, inGame = (game.players || []).includes(me);
   let h = "";
   if (err) h += `<div class="card" style="border-color:var(--acc)">${esc(err)}</div>`;
+  if (game.phase !== "lobby" && game.ver !== VER) h += `<div class="card" style="border-color:var(--acc)">⚠️ このゲームを始めた人と、このページのバージョンが違うかも。点数がずれるので、全員このページを開き直してね（Ctrl+F5）。</div>`;
   if (busy) h += `<div class="card row"><span>⏳ ${esc(busy)}</span><button class="sm" data-quit>やめる</button></div>`;
   if (game.phase === "lobby") {
     const ids = Object.keys(players);
