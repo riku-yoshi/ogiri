@@ -56,7 +56,7 @@ let game = { phase: "lobby" }, players = {}, answers = {};
 let draft = "", nameDraft = store.get("ogiri_name"), apiKey = store.get("ogiri_key"), model = store.get("ogiri_model") || "gemini-2.5-flash";
 let busy = "", err = "", judging = false, ready = false;
 let modelList = [], modelMsg = "", runId = 0;
-let voteDraft = {}, voteDraftKey = "", advancing = false;
+let voteDraft = {}, voteDraftKey = "", advancing = false, profiling = false;
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const nameOf = id => esc((players[id] && players[id].name) || "だれか");
@@ -182,6 +182,33 @@ function buildResult() {
   return res;
 }
 
+async function judgeProfiles() {
+  const gid = game.gameId, ids = game.players || [];
+  profiling = true; err = ""; render();
+  let entry;
+  try {
+    const nm = id => (players[id] && players[id].name) || "だれか";
+    const tot = totals();
+    const digest = ids.map((id, i) => {
+      let t = `[${i}] 名前: ${nm(id)} / 合計: ${fmt(tot[id])}点\n`;
+      for (let r = 0; r < TOTAL; r++) {
+        const v = ((game.results || {})[r] || {})[id];
+        if (v) t += `  第${r + 1}問 お題:${game.prompts[r]} 回答:${v.t} AI:${v.ai != null ? v.ai : "なし"} みんな:${v.v != null ? fmt(v.v) : "なし"}\n`;
+      }
+      return t;
+    }).join("\n");
+    const r = await askGemini(`大喜利ゲーム（全${TOTAL}問）が終わりました。各プレイヤーの回答の傾向を分析してください。\n各プレイヤーについて、「title（12字以内の面白い称号）」と「view（100字以内の見解。ボケの傾向、得意なパターン、AIや仲間からの評価の傾向を、ユーモアを交えて優しく）」を日本語で書いてください。悪口や人格を傷つける内容は避けてください。\n\n${digest}\n次のJSONだけを返す: {"players":[{"i":0,"title":"...","view":"..."}]}`);
+    const list = {};
+    ids.forEach((id, i) => { const x = (r.players || []).find(z => z.i === i); if (x) list[id] = { title: String(x.title || ""), view: String(x.view || "") }; });
+    entry = { ok: Object.keys(list).length > 0, list };
+  } catch (e) { err = "AIの分析に失敗: " + e.message; entry = { ok: false, list: {} }; }
+  busy = "";
+  try {
+    if (game.gameId === gid && game.phase === "final") await setDoc(gameRef, { profiles: entry }, { merge: true });
+  } catch (e) { err = "保存に失敗: " + e.message; }
+  profiling = false; render();
+}
+
 async function hostCheck() {
   if (!ready || game.hostId !== me || advancing) return;
   const ids = game.players || [], rnd = game.round;
@@ -192,6 +219,8 @@ async function hostCheck() {
     } else if (game.phase === "vote") {
       if (!(game.ai || {})[rnd]) { if (!judging) judgeAI(); return; }
       if (ids.every(id => answers[vkey(id)])) { advancing = true; moved = true; await setDoc(gameRef, { phase: "result", results: { [rnd]: buildResult() } }, { merge: true }); }
+    } else if (game.phase === "final") {
+      if (!game.profiles && !profiling) judgeProfiles();
     } else if (game.phase === "result") {
       if (ids.every(id => answers[nkey(id)])) { advancing = true; moved = true; await setDoc(gameRef, rnd + 1 >= TOTAL ? { phase: "final" } : { phase: "answer", round: rnd + 1 }, { merge: true }); }
     }
@@ -265,6 +294,12 @@ function render() {
     h += answers[nkey(me)] ? `<div class="card">✅ 準備OK。みんなを待っています（${np}/${ids.length}人）</div>` : `<button id="next">${game.round + 1 >= TOTAL ? "最終結果へ" : "次の問題へ"}</button><div class="sub" style="margin-top:6px">全員が押すと進むよ（${np}/${ids.length}人）</div>`;
   } else if (game.phase === "final") {
     h += `<div class="card"><b>🏆 最終結果</b>` + ranking().map(([id, s], i) => `<div class="row ans"><span class="${i === 0 ? "win" : ""}">${i + 1}位 ${nameOf(id)}</span><b>${fmt(s)}点</b></div>`).join("") + `</div>`;
+    const pf = game.profiles;
+    h += `<div class="card"><b>🧑‍⚖️ AIの見解</b>`;
+    if (!pf) h += `<div class="sub" style="margin-top:6px">AIが分析中…</div>`;
+    else if (!pf.ok) h += `<div class="sub" style="margin-top:6px">分析はできなかったよ</div>`;
+    else ranking().forEach(([id]) => { const p = (pf.list || {})[id]; if (p) h += `<div class="ans"><div class="row"><b>${nameOf(id)}</b><span class="tag">${esc(p.title)}</span></div><div>${esc(p.view)}</div></div>`; });
+    h += `</div>`;
     for (let r = 0; r < TOTAL; r++) {
       const res = (game.results || {})[r];
       if (res) h += `<div class="card"><span class="tag">第${r + 1}問</span><div class="odai" style="margin-top:8px">${esc(game.prompts[r])}</div>${resultRows(res)}</div>`;
