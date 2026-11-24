@@ -32,7 +32,7 @@ input,textarea{font:inherit;width:100%;padding:10px;border-radius:10px;border:1p
 </main>
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getFirestore, doc, collection, onSnapshot, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getFirestore, doc, getDoc, collection, onSnapshot, setDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
 // ▼▼ ここにFirebaseの設定を貼る（firebaseConfig の中身）▼▼
 const firebaseConfig = {
@@ -119,16 +119,30 @@ const ranking = () => Object.entries(totals()).sort((a, b) => b[1] - a[1]);
 async function join() { const n = nameDraft.trim().slice(0, 12); if (!n) return; store.set("ogiri_name", n); await setDoc(doc(fs, "ogiri_players", me), { name: n }); }
 async function kick(id) { await deleteDoc(doc(fs, "ogiri_players", id)); }
 
+const THEMES = ["電子レンジ","修学旅行のバス","ペンギン","自動ドア","図書館","エレベーター","ふるさと納税の返礼品","カラオケ","遊園地の待ち時間","宇宙飛行士","やかん","スマホの充電","駅の自動改札","回転寿司","お化け屋敷","結婚式のスピーチ","ラジオ体操","動物園のゾウ","新幹線の車内販売","コインランドリー","就活の面接","夏休みの宿題","サウナ","ドローン","忍者","ロボット掃除機","コタツ","花火大会","雨の日の傘","天気予報","キャンプ","自動販売機","銭湯","防災訓練","運動会","ゲームのラスボス","ファミレスの呼び出しボタン","映画館のポップコーン","ハンバーガーのおまけ","SNSのプロフィール","オンライン会議","ミステリー小説の犯人","ゴミ収集車","観覧車","ホテルの朝食バイキング","フリマアプリ","犬の散歩","スーパーのレジ待ち","おせち料理","ひな祭り","タイムマシン","魔法の杖","AIアシスタント","無人島","星座占い","百円ショップ","宅配ボックス","通販番組","卒業アルバム","文化祭の出し物","部活の合宿","大掃除","引っ越し","おみくじ","神社の絵馬","お笑いライブ","ドッキリ","動画配信サービス","スポーツ観戦","マラソン大会","温泉旅館","新入社員","地下鉄の路線図","ご当地キャラ","宝くじ","自撮り","サプライズパーティー","食べ放題","免許の更新","忘れ物センター","ペットショップ","博物館","イルミネーション","年賀状","バレンタイン","ハロウィン","ボウリング","天体観測","落とし物","満員電車","スマートスピーカー","観光地のお土産"];
+const FORMS = ["こんな〇〇は嫌だ。どんなの？","〇〇の意外な使い道","〇〇が言いそうなひとこと","〇〇の新商品。どんな味・機能？","〇〇の注意書きにありがちな一文","〇〇の口コミ（星1）にこう書いてあった","〇〇の取扱説明書に書いてある謎の一文","〇〇のキャッチコピーを考えて","〇〇が急に変なことを始めた。その理由は？","〇〇の次回予告","〇〇の都市伝説","〇〇に隠された意外な秘密","〇〇の裏ルール","〇〇のテーマソングの歌い出し","〇〇のビフォーアフター","〇〇禁止！その理由は？"];
+async function loadHistory() {
+  try { const d = await getDoc(doc(fs, "ogiri", "history")); return d.exists() && Array.isArray(d.data().list) ? d.data().list : []; } catch (e) { return []; }
+}
+async function saveHistory(prompts, old) {
+  try { await setDoc(doc(fs, "ogiri", "history"), { list: [...prompts, ...old].slice(0, 150) }); } catch (e) {}
+}
+
 async function start() {
   const ids = Object.keys(players);
   if (ids.length < 2) return;
   if (!apiKey) { err = "Geminiのキーを入れてね"; render(); return; }
   const run = ++runId; busy = "AIがお題を考え中…"; err = ""; render();
   try {
-    const r = await askGemini(`大喜利のお題を日本語で${TOTAL}個作ってください。「こんな〇〇は嫌だ」「〇〇の意外な使い道」「〇〇が言いそうなひとこと」など形式をバラけさせ、友達同士で盛り上がる軽いノリで。1つ40字以内。次のJSONだけを返す: {"prompts":["...",...]}`);
+    const hist = await loadHistory();
+    const themes = shuffle(THEMES).slice(0, TOTAL), forms = shuffle(FORMS).slice(0, TOTAL);
+    const plan = themes.map((t, i) => `${i + 1}. 題材: ${t} ／ 型: ${forms[i]}`).join("\n");
+    const past = hist.slice(0, 40).map(x => `- ${x}`).join("\n");
+    const r = await askGemini(`大喜利のお題を日本語で${TOTAL}個作ってください。\n次の「題材」と「型」の組み合わせを、1問ずつ使ってください（題材は必ずお題に入れる。型は自然に言い換えてOK）。\n${plan}\n\n条件:\n- 友達同士で盛り上がる軽いノリ。1つ40字以内。答えが一つに決まらず、誰でも答えやすいお題にする。\n- 9個すべて、雰囲気が違うものにする。\n- ありがちな題材は使わない（校長先生、美容院、美容師、コンビニ店員、上司、先生、医者、タクシー運転手など）。\n${past ? "- 次の過去のお題と、同じ・似たお題は作らない:\\n" + past + "\\n" : ""}次のJSONだけを返す: {"prompts":["...",...]}`);
     if (run !== runId) { busy = ""; render(); return; }
     const prompts = (r.prompts || []).slice(0, TOTAL);
     if (prompts.length < TOTAL) throw new Error("お題が足りませんでした");
+    saveHistory(prompts, hist);
     draft = "";
     await setDoc(gameRef, { phase: "answer", gameId: String(Date.now()), hostId: me, players: ids, round: 0, prompts, results: {}, ai: {}, ver: VER });
   } catch (e) { if (run !== runId) { busy = ""; render(); return; } err = "お題の生成に失敗: " + e.message; }
