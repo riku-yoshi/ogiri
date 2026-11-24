@@ -152,14 +152,18 @@ async function judgeAI() {
   judging = true; err = ""; render();
   let entry;
   try {
-    const list = rows.map((r, i) => `${i}: ${r.a.text}`).join("\n");
-    const r = await askGemini(`あなたは大喜利の審査員です。公平に採点してください。\nお題: ${game.prompts[rnd]}\n回答:\n${list}\n\n各回答を0〜10の整数で採点し、30字程度の短いコメントを日本語でつけてください。面白さ・意外性・お題への合い具合を見てください。次のJSONだけを返す: {"results":[{"i":0,"score":7,"comment":"..."}]}`);
+    const L = i => String.fromCharCode(65 + i);
+    const list = rows.map((r, i) => `${L(i)}: ${r.a.text}`).join("\n");
+    const r = await askGemini(`あなたは大喜利の審査員です。公平に採点してください。\nお題: ${game.prompts[rnd]}\n回答:\n${list}\n\n各回答を0〜10の整数で採点し、30字程度の短いコメントを日本語でつけてください。面白さ・意外性・お題への合い具合を見てください。回答の数（${rows.length}個）ぶん、すべて入れてください。次のJSONだけを返す: {"results":[{"label":"A","score":7,"comment":"..."}]}`);
+    const arr = Array.isArray(r.results) ? r.results : [];
     const scores = {};
     rows.forEach((row, i) => {
-      const x = (r.results || []).find(z => z.i === i) || {};
-      scores[row.id] = { s: Math.max(0, Math.min(10, Math.round(Number(x.score) || 0))), c: String(x.comment || "") };
+      const x = arr.find(z => String(z.label || "").trim().toUpperCase() === L(i)) || (arr.length === rows.length ? arr[i] : null);
+      const n = x ? Number(x.score) : NaN;
+      if (x && Number.isFinite(n)) scores[row.id] = { s: Math.max(0, Math.min(10, Math.round(n))), c: String(x.comment || "") };
     });
-    entry = { ok: true, scores };
+    if (Object.keys(scores).length < rows.length) err = "AIの返事の一部が読み取れませんでした（その回答は投票だけで決めます）";
+    entry = { ok: Object.keys(scores).length > 0, scores };
   } catch (e) { err = "AIの採点に失敗（投票だけで決めます）: " + e.message; entry = { ok: false }; }
   busy = "";
   try {
@@ -197,11 +201,12 @@ async function judgeProfiles() {
       }
       return t;
     }).join("\n");
-    const r = await askGemini(`大喜利ゲーム（全${TOTAL}問）が終わりました。各プレイヤーの回答の傾向を分析してください。\n各プレイヤーについて、「title（12字以内の面白い称号）」と「view（100字以内の見解。ボケの傾向、得意なパターン、AIや仲間からの評価の傾向を、ユーモアを交えて優しく）」を日本語で書いてください。悪口や人格を傷つける内容は避けてください。\n\n${digest}\n次のJSONだけを返す: {"players":[{"i":0,"title":"...","view":"..."}]}`);
+    const r = await askGemini(`大喜利ゲーム（全${TOTAL}問）が終わりました。各プレイヤーの回答の傾向を分析してください。\n各プレイヤーについて、「title（12字以内の面白い称号）」と「view（100字以内の見解。ボケの傾向、得意なパターン、AIや仲間からの評価の傾向を、ユーモアを交えて優しく）」を日本語で書いてください。悪口や人格を傷つける内容は避けてください。\n\n${digest}\n次のJSONだけを返す: {"players":[{"i":0,"name":"名前","title":"...","view":"..."}]}`);
     const list = {};
-    ids.forEach((id, i) => { const x = (r.players || []).find(z => z.i === i); if (x) list[id] = { title: String(x.title || ""), view: String(x.view || "") }; });
+    const arr = Array.isArray(r.players) ? r.players : [];
+    ids.forEach((id, i) => { const x = arr.find(z => z.name === nm(id)) || arr.find(z => Number(z.i) === i) || (arr.length === ids.length ? arr[i] : null); if (x) list[id] = { title: String(x.title || ""), view: String(x.view || "") }; });
     entry = { ok: Object.keys(list).length > 0, list };
-  } catch (e) { err = "AIの分析に失敗: " + e.message; entry = { ok: false, list: {} }; }
+  } catch (e) { err = "AIの分析に失敗: " + e.message; entry = { ok: false, list: {}, error: String(e.message || "").slice(0, 100) }; }
   busy = "";
   try {
     if (game.gameId === gid && game.phase === "final") await setDoc(gameRef, { profiles: entry }, { merge: true });
@@ -297,7 +302,7 @@ function render() {
     const pf = game.profiles;
     h += `<div class="card"><b>🧑‍⚖️ AIの見解</b>`;
     if (!pf) h += `<div class="sub" style="margin-top:6px">AIが分析中…</div>`;
-    else if (!pf.ok) h += `<div class="sub" style="margin-top:6px">分析はできなかったよ</div>`;
+    else if (!pf.ok) h += `<div class="sub" style="margin-top:6px">分析はできなかったよ${pf.error ? "（" + esc(pf.error) + "）" : ""}</div>${game.hostId === me ? `<div style="margin-top:6px"><button class="sm" id="retryp">もう一度分析する</button></div>` : ""}`;
     else ranking().forEach(([id]) => { const p = (pf.list || {})[id]; if (p) h += `<div class="ans"><div class="row"><b>${nameOf(id)}</b><span class="tag">${esc(p.title)}</span></div><div>${esc(p.view)}</div></div>`; });
     h += `</div>`;
     for (let r = 0; r < TOTAL; r++) {
@@ -310,7 +315,7 @@ function render() {
   const keep = document.activeElement && document.activeElement.id;
   $("#app").innerHTML = h;
   const on = (s, f) => { const el = $(s); if (el) el.onclick = f; };
-  on("#lm", listModels); on("#join", join); on("#start", start); on("#sub", submit); on("#next", pressNext); on("#vsub", submitVotes); on("#again", toLobby);
+  on("#lm", listModels); on("#join", join); on("#start", start); on("#sub", submit); on("#retryp", () => setDoc(gameRef, { profiles: null }, { merge: true })); on("#next", pressNext); on("#vsub", submitVotes); on("#again", toLobby);
   document.querySelectorAll("[data-model]").forEach(b => b.onclick = () => { model = b.dataset.model; store.set("ogiri_model", model); render(); });
   document.querySelectorAll("[data-quit]").forEach(b => b.onclick = quit);
   document.querySelectorAll("[data-vote]").forEach(b => b.onclick = () => { const [id, n] = b.dataset.vote.split("|"); voteDraft[id] = Number(n); render(); });
